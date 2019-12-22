@@ -1,0 +1,7 @@
+numpy
+pandas
+pymc3
+matplotlib
+scipy
+theano
+fbprophet
