@@ -5,16 +5,26 @@ import datetime
 import scipy
 
 
-def min_max_scaler(x):
-    """Min-max scaler function
-    
-    Arguments:
-        x {[list, numpy.ndarray]} -- Array to scale
-    
-    Returns:
-        [list, numpy.ndarray] -- Scaled array
-    """
-    return (x - min(x)) / (max(x) - min(x))
+class MinMaxScaler:
+
+    def __init__(self):
+
+        self.loc = None
+        self.scale = None
+
+    def fit(self, x):
+
+        self.loc = min(x)
+        self.scale = max(x) - min(x)
+
+    def transform(self, x):
+
+        return (x - self.loc) / self.scale
+
+    def fit_transform(self, x):
+
+        self.fit(x)
+        return self.transform(x)
 
 
 def random_timeseries(n_series = 5, n_years = 5):
@@ -65,9 +75,6 @@ def random_timeseries(n_series = 5, n_years = 5):
             y_i[j] += rw
             
         df['y_{}'.format(i)] = y_i
-        
-    # Scale numerical series
-    df.iloc[:,1:] = df.iloc[:, 1:].apply(min_max_scaler)
     
     return df
     
