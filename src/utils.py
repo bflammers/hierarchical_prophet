@@ -44,18 +44,36 @@ def random_walk(n, start=0, sigma=0.2):
     return x
 
 
+def _random_seasonality_base(time, period):
+
+    x = np.zeros(len(time))
+
+    period_sin = 2 * np.pi * np.random.choice([1, 2, 3, 4])
+    period_cos = 2 * np.pi * np.random.choice([1, 2, 3, 4])
+
+    x += np.sin(time / period * period_sin) * \
+         np.random.uniform(low=0.5, high=1.5)
+    x += np.cos(time / period * period_cos) * \
+         np.random.uniform(low=0.5, high=1.5)
+
+    return x
+
+
 def random_seasonality(time, yearly=True, monthly=False, weekly=False):
 
     x = np.zeros(len(time))
 
+    # Yearly period seasonality
     if yearly:
-        x += np.sin(time / days_in_year * 2 * np.pi * np.random.uniform(low=.5, high=1.5))  # Yearly period seasonality
+        x += _random_seasonality_base(time, days_in_year)
 
+    # Monthly period seasonality
     if monthly:
-        x += np.sin(time / days_in_month * 2 * np.pi * np.random.uniform(low=.5, high=1.5))  # Yearly period seasonality
+        x += _random_seasonality_base(time, days_in_month)
 
+    # Weekly period seasonality
     if weekly:
-        x += np.sin(time / 7 * 2 * np.pi * np.random.uniform(low=.5, high=1.5)) # Weekly period seasonality
+        x += _random_seasonality_base(time, 7)
 
     return x
 
@@ -92,7 +110,7 @@ def random_timeseries(n_series = 5, n_years = 5, equal_trend=False, equal_start=
     start = 0 
     trend = random_walk(n=len(time))
     seasonality = random_seasonality
-    error_sd = 1
+    error_sd = 0.5
     
     # Add random walks to base series
     for i in range(n_series):
@@ -110,14 +128,15 @@ def random_timeseries(n_series = 5, n_years = 5, equal_trend=False, equal_start=
             error_sd = np.random.uniform(high=2)
     
         # Generate base series
-        y = start + seasonality # trend + seasonality
-        # y += np.random.normal(size=len(time), scale=error_sd) # Error term
+        y = start + seasonality + trend
+        y += np.random.normal(size=len(time), scale=error_sd) # Error term
         
         # Construct df
         df['y_{}'.format(i)] = y
     
     return df
-    
+
+
 if __name__=='__main__':
 
     df = random_timeseries()
