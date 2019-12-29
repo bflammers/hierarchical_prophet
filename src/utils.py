@@ -59,7 +59,7 @@ def _random_seasonality_base(time, period):
     return x
 
 
-def random_seasonality(time, yearly=True, monthly=False, weekly=False):
+def random_seasonality(time, yearly=True, monthly=False, weekly=True):
 
     x = np.zeros(len(time))
 
@@ -69,17 +69,18 @@ def random_seasonality(time, yearly=True, monthly=False, weekly=False):
 
     # Monthly period seasonality
     if monthly:
-        x += _random_seasonality_base(time, days_in_month)
+        x += _random_seasonality_base(time, days_in_month) * 0.6
 
     # Weekly period seasonality
     if weekly:
-        x += _random_seasonality_base(time, 7)
+        x += _random_seasonality_base(time, 7) * 0.3
 
     return x
 
 
-def random_timeseries(n_series = 5, n_years = 5, equal_trend=False, equal_start=False, 
-    equal_seasonality=False, equal_error=False):
+def random_timeseries(n_series = 5, n_years = 5, equal_trend=False,
+                      equal_start=False, equal_seasonality=False,
+                      equal_error=False):
     """Function that generated a dataframe with correlated timeseries
     
     Keyword Arguments:
