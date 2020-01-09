@@ -63,6 +63,90 @@ def fourier_series(t, p, n):
     return x
 
 
+def changepoints(t, n_changepoints, changepoint_range=0.8):
+    """Make required arrays for defining chagepoints needed for trend
+    
+    Arguments:
+        t {numpy.ndarray} -- Array of timestamps
+        n_changepoints {int} -- Number of changepoints
+    
+    Keyword Arguments:
+        changepoint_range {float} -- Defined proportion of time that 
+        changepoints should be included (default: {0.8})
+    
+    Returns:
+        tuple -- tuple of numpy.ndarrays s and A 
+    """
+
+    # Array of changepoints in time dimension
+    s = np.linspace(0, changepoint_range * np.max(t), n_changepoints + 1)[1:]
+
+    # A is a boolean matrix specifying which observation time stamps (vector t) --> rows
+    # have surpasses which changepoint time stamps (vector s) --> columns
+    # * 1 casts the boolean to integers
+    A = (t[:, None] > s) * 1
+
+    return s, A 
+
+
+def add_trend(model, idx, t, s, A, n_series, n_changepoints):
+
+    with model:
+        
+        # Hyper priors
+        
+        k_mu = pm.Normal('k_mu', mu=0., sd=10) # sd=10
+        k_sigma = pm.HalfCauchy('k_sigma', testval=1, beta=5) # beta=5
+        
+        m_mu = pm.Normal('m_mu', mu=0., sd=10) # sd=10
+        m_sigma = pm.HalfCauchy('m_sigma', testval=1, beta=5) # sd=5
+
+        delta_b = pm.HalfCauchy('delta_b', testval=0.1, beta=0.1) # beta=0.1
+        
+        # Priors
+        k = pm.Normal('k', k_mu, k_sigma, shape=n_series)
+        m = pm.Normal('m', m_mu, m_sigma, shape=n_series)
+
+        delta = pm.Laplace('delta', 0, delta_b, shape = (n_series, n_changepoints))
+                
+        # Starting point (offset)
+        g = m[idx]
+        
+        # Linear trend w/ changepoints
+        gamma = -s * delta[idx, :]
+        g += (k[idx] + (A * delta[idx, :]).sum(axis=1)) * t + (A * gamma).sum(axis=1)
+
+    return g
+
+
+def add_seasonality(model, idx, F_yearly, F_weekly, n_series):
+
+    n_fourier_yearly = F_yearly.shape[1] #/ 2
+    n_fourier_weekly = F_weekly.shape[1] #/ 2
+
+    with model:
+    
+        # Hyper priors
+        
+        beta_yearly_mu = pm.Normal('beta_yearly_mu', mu=0., sd=3) # Prophet: sd=10 / sd=3
+        beta_yearly_sigma = pm.HalfCauchy('beta_yearly_sigma', testval=1, beta=2) # Prophet: beta=5 / beta=2
+        
+        beta_weekly_mu = pm.Normal('beta_weekly_mu', mu=0., sd=3) # Prophet: sd=10 / sd=3
+        beta_weekly_sigma = pm.HalfCauchy('beta_weekly_sigma', testval=1, beta=2) # Prophet: beta=5 / beta=2
+        
+        # Priors
+        
+        beta_yearly = pm.Normal('beta_yearly', beta_yearly_mu, beta_yearly_sigma, 
+                                shape = (n_fourier_yearly, n_series))
+        beta_weekly = pm.Normal('beta_weekly', beta_weekly_mu, beta_weekly_sigma, 
+                                shape = (n_fourier_weekly, n_series))
+        
+        # Seasonality
+        s = (F_yearly * beta_yearly[:, idx].T).sum(axis=-1)
+        s += (F_weekly * beta_weekly[:, idx].T).sum(axis=-1)
+
+    return s
+
 if __name__=='__main__':
 
     cols = ['ds', 't', 'y_0', 'y_1']
