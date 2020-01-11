@@ -14,19 +14,6 @@ def stack_series(df):
     Returns:
         tuple -- tuple of numpy.ndarray --> ds, t, idx, y
     """
-
-    # Validity checks
-    col_names = df.columns
-    assert 'ds' in col_names, 'ds not a column'
-    assert 't' in col_names, 't not a column'
-
-    ts_names = [x for x in col_names if x not in {'ds', 't'}]
-    ts_pre = np.array([x[:2] for x in ts_names], dtype=str)
-    ts_suf = np.array([x[2:] for x in ts_names], dtype=int)
-    assert all(ts_pre == 'y_'), 'time series columns should be pre-fixed with y_'
-    assert ts_suf[0] == 0, 'time series columns suffixes should start at 0'
-    assert all(np.diff(np.array(ts_suf)) == 1), \
-        'series columns should be named y_{0,1,2,3,4,...}'
     
     # Stack
     df_stacked = df.set_index(['ds', 't']).stack().reset_index()
@@ -63,6 +50,47 @@ def fourier_series(t, p, n):
     return x
 
 
+def validate_df(df):
+
+    # Validity checks
+    col_names = df.columns
+    assert 'ds' in col_names, 'ds not a column'
+    assert 't' in col_names, 't not a column'
+
+    ts_names = [x for x in col_names if x not in {'ds', 't'}]
+    ts_pre = np.array([x[:2] for x in ts_names], dtype=str)
+    ts_suf = np.array([x[2:] for x in ts_names], dtype=int)
+    assert all(ts_pre == 'y_'), 'time series columns should be pre-fixed with y_'
+    assert ts_suf[0] == 0, 'time series columns suffixes should start at 0'
+    assert all(np.diff(np.array(ts_suf)) == 1), \
+        'series columns should be named y_{0,1,2,3,4,...}'
+
+
+class MinMaxScaler:
+
+    def __init__(self, centering=True, scaling=True):
+
+        self.centering=centering
+        self.scaling=scaling
+
+        self.loc = None
+        self.scale = None
+
+    def fit(self, x):
+
+        self.loc = min(x) if self.centering else 0
+        self.scale = max(x) - min(x) if self.centering else 1
+
+    def transform(self, x):
+
+        return (x - self.loc) / self.scale
+
+    def fit_transform(self, x):
+
+        self.fit(x)
+        return self.transform(x)
+
+
 def changepoints(t, n_changepoints, changepoint_range=0.8):
     """Make required arrays for defining chagepoints needed for trend
     
@@ -89,65 +117,150 @@ def changepoints(t, n_changepoints, changepoint_range=0.8):
     return s, A 
 
 
-def add_trend(model, idx, t, s, A, n_series, n_changepoints):
+class HierarchicalProphet:
 
-    with model:
-        
-        # Hyper priors
-        
-        k_mu = pm.Normal('k_mu', mu=0., sd=10) # sd=10
-        k_sigma = pm.HalfCauchy('k_sigma', testval=1, beta=5) # beta=5
-        
-        m_mu = pm.Normal('m_mu', mu=0., sd=10) # sd=10
-        m_sigma = pm.HalfCauchy('m_sigma', testval=1, beta=5) # sd=5
+    def __init__(self, scale=True, 
+        trend=True, seasonality=True, n_changepoints=20, changepoints_range=0.8, 
+        fourier_params=[{'period': 365.25, 'n_fourier': 10}, {'period': 7, 'n_fourier': 4}],
+        full_posterior=False, maxeval=5000):
 
-        delta_b = pm.HalfCauchy('delta_b', testval=0.1, beta=0.1) # beta=0.1
-        
-        # Priors
-        k = pm.Normal('k', k_mu, k_sigma, shape=n_series)
-        m = pm.Normal('m', m_mu, m_sigma, shape=n_series)
+        # Model parameters
+        self.scale = scale
+        self.trend = trend
+        self.seasonality = seasonality
+        self.n_changepoints = n_changepoints
+        self.changepoint_range = changepoints_range
+        self.fourier_components = fourier_params
+        self.full_posterior = full_posterior
+        self.maxeval=maxeval
 
-        delta = pm.Laplace('delta', 0, delta_b, shape = (n_series, n_changepoints))
+        # Intialize attributes
+        self.scalers = {} # Dictionary of MinMaxScaler objects
+        self.model = None # PyMC3 model object
+        self.n_series = None # Number of series, determined in fitting step
+        self.pe = None # Point estimates
+
+    def fit(self, X):
+
+        # Validate dataframe
+        validate_df(X)
+
+        # Fit and transform scalers
+        df_scaled = self._fit_transform_scalers(X)
+
+        # Transform dataframe into arrays with required format
+        ds, t, idx, y = stack_series(df_scaled)
+
+        # Set number of series
+        self.n_series = max(idx) + 1
+
+        # Generate a PyMC3 Model context
+        self.model = pm.Model()
+
+        # Construct mu array
+        mu_t = np.zeros(shape=t.shape)
+
+        if self.trend:
+
+            # Determine points in time for changepoint
+            s, A = changepoints(t, self.n_changepoints, self.changepoint_range)
+
+            # Add trend component
+            mu_t += self.add_trend(t, idx, s, A)
+
+        if self.seasonality:
+
+            for fc in self.fourier_components:
                 
-        # Starting point (offset)
-        g = m[idx]
-        
-        # Linear trend w/ changepoints
-        gamma = -s * delta[idx, :]
-        g += (k[idx] + (A * delta[idx, :]).sum(axis=1)) * t + (A * gamma).sum(axis=1)
+                # Scale fourier period with time scaler object
+                fc['period_scaled'] = self.scalers['t'].transform(fc['period'])
 
-    return g
+                # Generate array with fourier base components
+                fc['F'] = fourier_series(t, fc['period_scaled'], fc['n_fourier'])
+
+                mu_t += self.add_seasonality(idx, fc['F'], str(fc['period']))
+
+        with self.model:
+
+            # Likelihood
+            sigma = pm.HalfCauchy('sigma', .5, testval=1, shape=self.n_series)
+            Y_obs = pm.Normal('Y_obs', mu=mu_t, sd=sigma[idx], observed=y)
+
+        # Fitting step
+        if self.full_posterior:
+            raise NotImplementedError('Full posterior not supported yet')
+        else:
+
+            with self.model:
+                self.pe = pm.find_MAP(maxeval=self.maxeval)
 
 
-def add_seasonality(model, idx, F_yearly, F_weekly, n_series):
+    def _fit_transform_scalers(self, df):
 
-    n_fourier_yearly = F_yearly.shape[1] #/ 2
-    n_fourier_weekly = F_weekly.shape[1] #/ 2
+        for col in df:
 
-    with model:
-    
-        # Hyper priors
-        
-        beta_yearly_mu = pm.Normal('beta_yearly_mu', mu=0., sd=3) # Prophet: sd=10 / sd=3
-        beta_yearly_sigma = pm.HalfCauchy('beta_yearly_sigma', testval=1, beta=2) # Prophet: beta=5 / beta=2
-        
-        beta_weekly_mu = pm.Normal('beta_weekly_mu', mu=0., sd=3) # Prophet: sd=10 / sd=3
-        beta_weekly_sigma = pm.HalfCauchy('beta_weekly_sigma', testval=1, beta=2) # Prophet: beta=5 / beta=2
-        
-        # Priors
-        
-        beta_yearly = pm.Normal('beta_yearly', beta_yearly_mu, beta_yearly_sigma, 
-                                shape = (n_fourier_yearly, n_series))
-        beta_weekly = pm.Normal('beta_weekly', beta_weekly_mu, beta_weekly_sigma, 
-                                shape = (n_fourier_weekly, n_series))
-        
-        # Seasonality
-        s = (F_yearly * beta_yearly[:, idx].T).sum(axis=-1)
-        s += (F_weekly * beta_weekly[:, idx].T).sum(axis=-1)
+            # Do not scale date column
+            if col != 'ds':
+            
+                # Construct scaler
+                scaler = MinMaxScaler()
+                
+                # Fit scaler and return scaled column
+                df[col] = scaler.fit_transform(df[col])
+                
+                # Store column scaler in dict
+                self.scalers[col] = scaler
 
-    return s
+        return df
+
+    def add_trend(self, t, idx, s, A):
+
+        with self.model:
+            
+            # Hyper priors
+            k_mu = pm.Normal('k_mu', mu=0., sd=10) # sd=10
+            k_sigma = pm.HalfCauchy('k_sigma', testval=1, beta=5) # beta=5
+            
+            m_mu = pm.Normal('m_mu', mu=0., sd=10) # sd=10
+            m_sigma = pm.HalfCauchy('m_sigma', testval=1, beta=5) # beta=5
+
+            delta_b = pm.HalfCauchy('delta_b', testval=0.1, beta=0.1) # beta=0.1
+            
+            # Priors
+            k = pm.Normal('k', k_mu, k_sigma, shape=self.n_series)
+            m = pm.Normal('m', m_mu, m_sigma, shape=self.n_series)
+
+            delta = pm.Laplace('delta', 0, delta_b, shape = (self.n_series, self.n_changepoints))
+                    
+            # Starting point (offset)
+            g_t = m[idx]
+            
+            # Linear trend w/ changepoints
+            gamma = -s * delta[idx, :]
+            g_t += (k[idx] + (A * delta[idx, :]).sum(axis=1)) * t + (A * gamma).sum(axis=1)
+
+        return g_t
+
+    def add_seasonality(self, idx, F, suffix):
+
+        with self.model:
+        
+            # Hyper priors
+            beta_mu = pm.Normal('beta_mu_{}'.format(suffix), mu=0., sd=3) # Prophet: sd=10 / sd=3
+            beta_sigma = pm.HalfCauchy('beta_sigma_{}'.format(suffix), testval=1, beta=2) # Prophet: beta=5 / beta=2
+            
+            # Priors
+            beta = pm.Normal('beta_{}'.format(suffix), beta_mu, beta_sigma, shape = (F.shape[1], self.n_series))
+            
+            # Seasonality
+            s_t = (F * beta[:, idx].T).sum(axis=-1)
+
+        return s_t
+
 
 if __name__=='__main__':
+
+    import utils
 
     cols = ['ds', 't', 'y_0', 'y_1']
 
@@ -156,7 +269,7 @@ if __name__=='__main__':
         columns=cols
         )
 
-    print(df)
-    ds, t, idx, y = stack_series(df)
+    df = utils.random_timeseries()
 
-    print(y)
+    hp = HierarchicalProphet()
+    hp.fit(df)

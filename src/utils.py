@@ -8,31 +8,6 @@ days_in_year = 365.25
 days_in_month = days_in_year / 12
 
 
-class MinMaxScaler:
-
-    def __init__(self, centering=True, scaling=True):
-
-        self.centering=centering
-        self.scaling=scaling
-
-        self.loc = None
-        self.scale = None
-
-    def fit(self, x):
-
-        self.loc = min(x) if self.centering else 0
-        self.scale = max(x) - min(x) if self.centering else 1
-
-    def transform(self, x):
-
-        return (x - self.loc) / self.scale
-
-    def fit_transform(self, x):
-
-        self.fit(x)
-        return self.transform(x)
-
-
 def random_walk(n, start=0, sigma=0.2):
 
     x = np.ndarray(n)
