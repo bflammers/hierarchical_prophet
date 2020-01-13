@@ -98,7 +98,7 @@ def changepoints(t, n_changepoints, changepoint_range=0.8):
     """Make required arrays for defining chagepoints needed for trend
     
     Arguments:
-        t {numpy.ndarray} -- Array of timestamps
+        t {numpy.ndarray} -- Array of scaled timestamps
         n_changepoints {int} -- Number of changepoints
     
     Keyword Arguments:
@@ -110,7 +110,19 @@ def changepoints(t, n_changepoints, changepoint_range=0.8):
     """
 
     # Array of changepoints in time dimension
-    s = np.linspace(np.min(t), changepoint_range * np.max(t), n_changepoints + 1)[1:]
+    s = np.linspace(np.min(t), changepoint_range, n_changepoints + 1)[1:]
+
+    # If any points fall into the future (larger than 1), make future changepoints
+    if any(t > 1):
+
+        # Calculate number of future changepoints
+        n_future_changepoints = int(np.ceil(n_changepoints * (max(t) - 1)))
+
+        # Determine timepoints of future changepoints
+        s_future = np.linspace(1, max(t), n_future_changepoints + 1)[1:]
+
+        # Combine with past changepoints
+        s = np.append(s, s_future)
 
     # A is a boolean matrix specifying which observation time stamps (vector t) --> rows
     # have surpasses which changepoint time stamps (vector s) --> columns
@@ -124,7 +136,7 @@ class HierarchicalProphet:
 
     def __init__(self,
         trend=True, trend_hierarchical=True, seasonality=True, seasonality_hierarchical=False,
-        n_changepoints=20, changepoints_range=0.8, 
+        n_changepoints=50, changepoints_range=0.8, 
         fourier_params=[{'period': 365.25, 'n_fourier': 8}, {'period': 7, 'n_fourier': 4}],
         full_posterior=False, maxeval=5000):
 
@@ -281,30 +293,21 @@ class HierarchicalProphet:
     def sample_trend(self, t, hyper=False):
 
         t = self.scalers['t'].transform(t)
-        future = t > 1
 
-        s = np.empty(0, float)
+        s, A = changepoints(t, self.n_changepoints, self.changepoint_range)
+        delta = self.pe['delta'].T
 
-        if any(~future):
-            s_past, _ = changepoints(t, self.n_changepoints, self.changepoint_range)
-            s = np.append(s, s_past)
+        if any(t > 1):
 
-        if any(future):
-            n_future_changepoints = int(np.ceil(self.n_changepoints * (max(t) - 1)))
-            s_future, _ = changepoints(t, n_future_changepoints, 1)
-            s = np.append(s, s_future)
-
+            n_future_changepoints = len(s) - self.n_changepoints
             future_delta = np.random.laplace(0, self.pe['delta_b'], (n_future_changepoints, self.n_series))
-            delta = np.r_[self.pe['delta'].T, future_delta]
+            delta = np.r_[delta, future_delta]
 
-        else:
-
-            delta = self.pe['delta'].T
-
-        A = (t[:, None] > s) * 1
-
-        m = self.pe['m']
-        k = self.pe['k']
+        # Fix dimensions
+        m = np.repeat(self.pe['m'][None, :], t.shape[0], axis=0)
+        k = np.repeat(self.pe['k'][None, :], t.shape[0], axis=0)
+        s = np.repeat(s[:, None], self.n_series, axis=1)
+        t = np.repeat(t[:, None], self.n_series, axis=1)
 
         # print('m: ', m.shape)
         # print('k: ', k.shape)
@@ -312,14 +315,13 @@ class HierarchicalProphet:
         # print('A: ', A.shape)
         # print('t: ', t.shape)
         # print('s: ', s.shape)
+        # print('n_changepoints: ', self.n_changepoints)
 
-        y = np.repeat(m[None, :], t.shape[0], axis=0)
-        y += A @ delta * np.repeat(t[:, None], self.n_series, axis=1)
-        y += A @ (-np.repeat(s[:, None], delta.shape[1], axis=1) * delta)
+        g_t = m
+        g_t += (k + A @ delta) * t
+        g_t += A @ (-s * delta)
 
-        # print('y: ', y.shape)
-
-        return t, y
+        return t, g_t
 
     def add_seasonality(self, idx, F, suffix):
 
@@ -346,7 +348,6 @@ class HierarchicalProphet:
             s_t = (F * beta[:, idx].T).sum(axis=-1)
 
         return s_t
-
 
     def sample_seasonality(self, t, hyper=False):
 
@@ -375,14 +376,42 @@ class HierarchicalProphet:
 
         return t, s_t
 
-    def sample(self, t, hyper=False):
+    def sample_eps(self, t):
+        
+        e_t = np.random.normal(0, self.pe['sigma'], size = (len(t), self.n_series))
+
+        return t, e_t
+
+    def sample(self, t, past_uncertainty=True, hyper=False):
 
         _, g_t = self.sample_trend(t, hyper=hyper)
         t, s_t = self.sample_seasonality(t, hyper=hyper)
 
-        y = g_t + s_t
+        y_t = g_t + s_t 
 
-        return self._construct_df(t, y)
+        if past_uncertainty:
+            _, e_t = self.sample_eps(t)
+            y_t += e_t
+
+        return self._construct_df(t, y_t)
+
+    def empirical_quantiles(self, t, quantiles=[0.05, 0.5, 0.95], n_samples=1000):
+
+        samples = np.ndarray((len(t), self.n_series, n_samples))
+
+        for i in range(n_samples):
+
+            samples[:, :, i] = self.sample(t, past_uncertainty=True).drop(columns='t')
+
+        quantiles = np.quantile(samples, quantiles, axis = 2)
+
+        return quantiles
+
+
+
+
+
+
 
 
 if __name__=='__main__':
