@@ -3,31 +3,9 @@ import numpy as np
 import pandas as pd
 import pymc3 as pm
 import theano.tensor as tt
+import scipy
 
-
-def stack_series(df):
-    """Stack multiple time series into single array with corresponding t, ds, and idx arrays
-    
-    Arguments:
-        df {pandas.DataFrame} -- DataFrame with columns [t, y_{0, 1, 2, 3, 4, ...}]
-    
-    Returns:
-        tuple -- tuple of numpy.ndarray --> t, idx, y
-    """
-    
-    # Stack
-    df_stacked = df.set_index('t').stack().reset_index()
-    
-    # Extract relevant columns as numpy arrays
-    t = df_stacked['t'].values
-    y = df_stacked[0].values
-
-    # Extract series idxs
-    col_names = df_stacked['level_1'].astype(str)
-    series_num = col_names.str.split('_', expand=True)[1]
-    idx = series_num.astype(int).values
-    
-    return t, idx, y 
+from src.utils import MinMaxScaler, validate_df, stack_series
 
 
 def fourier_series(t, p, n):
@@ -47,51 +25,6 @@ def fourier_series(t, p, n):
     x = x * t[:, None]
     x = np.concatenate((np.cos(x), np.sin(x)), axis=1)
     return x
-
-
-def validate_df(df):
-
-    # Validity checks
-    col_names = df.columns
-    assert 'ds' not in col_names, 'ds should not be included'
-    assert 't' in col_names, 't should be included'
-
-    ts_names = [x for x in col_names if x != 't']
-    ts_pre = np.array([x[:2] for x in ts_names], dtype=str)
-    ts_suf = np.array([x[2:] for x in ts_names], dtype=int)
-    assert all(ts_pre == 'y_'), 'time series columns should be pre-fixed with y_'
-    assert ts_suf[0] == 0, 'time series columns suffixes should start at 0'
-    assert all(np.diff(np.array(ts_suf)) == 1), \
-        'series columns should be named y_{0,1,2,3,4,...}'
-
-
-class MinMaxScaler:
-
-    def __init__(self, centering=True, scaling=True):
-
-        self.centering=centering
-        self.scaling=scaling
-
-        self.loc = None
-        self.scale = None
-
-    def fit(self, x):
-
-        self.loc = min(x) if self.centering else 0
-        self.scale = max(x) - min(x) if self.centering else 1
-
-    def transform(self, x):
-
-        return (x - self.loc) / self.scale
-
-    def fit_transform(self, x):
-
-        self.fit(x)
-        return self.transform(x)
-
-    def inverse_transform(self, x):
-
-        return x * self.scale + self.loc
 
 
 def changepoints(t, n_changepoints, changepoint_range=0.8):
@@ -136,7 +69,7 @@ class HierarchicalProphet:
 
     def __init__(self,
         trend=True, trend_hierarchical=True, seasonality=True, seasonality_hierarchical=False,
-        n_changepoints=50, changepoints_range=0.8, 
+        eps_hierarchical=False, n_changepoints=50, changepoints_range=0.8, 
         fourier_params=[{'period': 365.25, 'n_fourier': 8}, {'period': 7, 'n_fourier': 4}],
         full_posterior=False, maxeval=5000):
 
@@ -145,6 +78,7 @@ class HierarchicalProphet:
         self.trend_hierarchical = trend_hierarchical
         self.seasonality = seasonality
         self.seasonality_hierarchical = seasonality_hierarchical 
+        self.eps_hierarchical = eps_hierarchical
         self.n_changepoints = n_changepoints
         self.changepoint_range = changepoints_range
         self.fourier_components = fourier_params
@@ -199,12 +133,9 @@ class HierarchicalProphet:
 
                 mu_t += self.add_seasonality(idx, fc['F'], str(fc['period']))
 
-        with self.model:
-
-            # Likelihood
-            sigma = pm.HalfCauchy('sigma', .5, testval=1, shape=self.n_series)
-            Y_obs = pm.Normal('Y_obs', mu=mu_t, sd=sigma[idx], observed=y)
-
+        # Add likelihood function
+        self.likelihood(t, y, mu_t, idx)
+        
         # Fitting step
         if self.full_posterior:
             raise NotImplementedError('Full posterior not supported yet')
@@ -230,22 +161,65 @@ class HierarchicalProphet:
 
         return df_scaled
 
-    def _construct_df(self, t, y):
+    def _construct_df(self, t, y, hyper=False):
 
-        # Construct dataframe with all columns in the right order
-        df = pd.DataFrame(y, columns=[x for x in self.df_columns if x != 't'])
-        df['t'] = t
-        df = df[self.df_columns]
+        if hyper:
 
-        for col in df:
-            
-            # Load scaler from dict
-            scaler = self.scalers[col]
-            
-            # Rescale column
-            df[col] = scaler.inverse_transform(df[col])
+            # Construct dataframe with all columns in the right order
+            # df = pd.DataFrame({'t': t, 'y': y})
+            ys = np.empty((len(t), self.n_series))
+
+            for i, col in enumerate(set(self.df_columns) - {'t'}):
+                
+                # Load scaler from dict
+                scaler = self.scalers[col]
+                
+                # Rescale column
+                ys[:, i] = scaler.inverse_transform(y)[:, 0]
+
+            df = pd.DataFrame({
+                't': self.scalers['t'].inverse_transform(t), 
+                'y': np.median(ys, axis=1)
+                })
+
+        else:
+
+            # Construct dataframe with all columns in the right order
+            df = pd.DataFrame(y, columns=[x for x in self.df_columns if x != 't'])
+            df['t'] = t
+            df = df[self.df_columns]
+
+            for col in df:
+                
+                # Load scaler from dict
+                scaler = self.scalers[col]
+                
+                # Rescale column
+                df[col] = scaler.inverse_transform(df[col])
 
         return df
+
+    def likelihood(self, t, y, mu_t, idx):
+
+        if self.eps_hierarchical:
+
+            with self.model:
+
+                # Prior
+                sigma_beta = pm.HalfCauchy('sigma_beta', .5, testval=1)
+
+                # Likelihood
+                sigma = pm.HalfCauchy('sigma', sigma_beta, shape=self.n_series)
+                Y_obs = pm.Normal('Y_obs', mu=mu_t, sd=sigma[idx], observed=y)
+
+        else:
+
+            with self.model:
+
+                # Likelihood
+                sigma = pm.HalfCauchy('sigma', .5, testval=1, shape=self.n_series)
+                Y_obs = pm.Normal('Y_obs', mu=mu_t, sd=sigma[idx], observed=y)
+
 
     def add_trend(self, t, idx, s, A):
 
@@ -295,31 +269,35 @@ class HierarchicalProphet:
         t = self.scalers['t'].transform(t)
 
         s, A = changepoints(t, self.n_changepoints, self.changepoint_range)
-        delta = self.pe['delta'].T
 
-        if any(t > 1):
+        if hyper:
 
-            n_future_changepoints = len(s) - self.n_changepoints
-            future_delta = np.random.laplace(0, self.pe['delta_b'], (n_future_changepoints, self.n_series))
-            delta = np.r_[delta, future_delta]
+            assert self.trend_hierarchical, 'hyper=True but trend not hierarchical'
 
-        # Fix dimensions
-        m = np.repeat(self.pe['m'][None, :], t.shape[0], axis=0)
-        k = np.repeat(self.pe['k'][None, :], t.shape[0], axis=0)
-        s = np.repeat(s[:, None], self.n_series, axis=1)
-        t = np.repeat(t[:, None], self.n_series, axis=1)
+            m = np.random.normal(self.pe['m_mu'], self.pe['m_sigma'])
+            k = np.random.normal(self.pe['k_mu'], self.pe['k_sigma'])
+            delta = np.random.laplace(0, self.pe['delta_b'], (A.shape[1], 1))
 
-        # print('m: ', m.shape)
-        # print('k: ', k.shape)
-        # print('delta: ', delta.shape)
-        # print('A: ', A.shape)
-        # print('t: ', t.shape)
-        # print('s: ', s.shape)
-        # print('n_changepoints: ', self.n_changepoints)
+        else:
+
+            delta = self.pe['delta'].T
+
+            if any(t > 1):
+
+                # MAD is the MLE for beta parameter of laplace distribution
+                beta = scipy.stats.median_absolute_deviation(self.pe['delta'], axis=1)
+
+                n_future_changepoints = len(s) - self.n_changepoints
+                future_delta = np.random.laplace(0, beta, (n_future_changepoints, self.n_series))
+                delta = np.r_[delta, future_delta]
+
+            # Fix dimensions
+            m = np.repeat(self.pe['m'][None, :], t.shape[0], axis=0)
+            k = np.repeat(self.pe['k'][None, :], t.shape[0], axis=0)
 
         g_t = m
-        g_t += (k + A @ delta) * t
-        g_t += A @ (-s * delta)
+        g_t += (k + A @ delta) * t[:, None]
+        g_t += A @ (-s[:, None] * delta)
 
         return t, g_t
 
@@ -358,7 +336,8 @@ class HierarchicalProphet:
         t = self.scalers['t'].transform(t)
 
         # Construct s array
-        s_t = np.zeros(shape=(t.shape[0], self.n_series))
+        s_t_n_cols = 1 if hyper else self.n_series
+        s_t = np.zeros(shape=(t.shape[0], s_t_n_cols))
 
         for fc in self.fourier_components:
 
@@ -368,7 +347,7 @@ class HierarchicalProphet:
             if hyper:
                 beta_mu = self.pe['beta_mu_{}'.format(p)]
                 beta_sigma = self.pe['beta_sigma_{}'.format(p)]
-                beta = np.random.normal(beta_mu, beta_sigma, size=(F.shape[1], self.n_series))
+                beta = np.random.normal(beta_mu, beta_sigma, size=(F.shape[1], 1))
             else:
                 beta = self.pe['beta_{}'.format(p)]
 
@@ -376,42 +355,44 @@ class HierarchicalProphet:
 
         return t, s_t
 
-    def sample_eps(self, t):
-        
-        e_t = np.random.normal(0, self.pe['sigma'], size = (len(t), self.n_series))
+    def sample_eps(self, t, hyper=False):
+
+        if hyper:
+
+            assert self.eps_hierarchical, 'hyper=True but eps not hierarchical'
+            e_t = np.random.normal(0, self.pe['sigma_beta'], size = (len(t), 1))
+
+        else:
+
+            e_t = np.random.normal(0, self.pe['sigma'], size = (len(t), self.n_series))
 
         return t, e_t
 
-    def sample(self, t, past_uncertainty=True, hyper=False):
+    def sample(self, t, white_noise=True, hyper=False):
 
         _, g_t = self.sample_trend(t, hyper=hyper)
         t, s_t = self.sample_seasonality(t, hyper=hyper)
 
         y_t = g_t + s_t 
 
-        if past_uncertainty:
-            _, e_t = self.sample_eps(t)
+        if white_noise:
+            _, e_t = self.sample_eps(t, hyper=hyper)
             y_t += e_t
 
-        return self._construct_df(t, y_t)
+        return self._construct_df(t, y_t, hyper=hyper)
 
-    def empirical_quantiles(self, t, quantiles=[0.05, 0.5, 0.95], n_samples=1000):
+    def empirical_quantiles(self, t, quantiles=[0.05, 0.5, 0.95], n_samples=1000, 
+        white_noise=True, hyper=False):
 
         samples = np.ndarray((len(t), self.n_series, n_samples))
 
         for i in range(n_samples):
 
-            samples[:, :, i] = self.sample(t, past_uncertainty=True).drop(columns='t')
+            samples[:, :, i] = self.sample(t, white_noise, hyper).drop(columns='t')
 
         quantiles = np.quantile(samples, quantiles, axis = 2)
 
         return quantiles
-
-
-
-
-
-
 
 
 if __name__=='__main__':
@@ -428,7 +409,7 @@ if __name__=='__main__':
     print(stack_series(df))
     exit()
 
-    df = utils.random_timeseries()
+    df = random.random_timeseries()
 
     hp = HierarchicalProphet()
     hp.fit(df)
