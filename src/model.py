@@ -3,9 +3,16 @@ import numpy as np
 import pandas as pd
 import pymc3 as pm
 import theano.tensor as tt
-import scipy
+import scipy.stats as st
+import warnings
 
 from src.utils import MinMaxScaler, validate_df, stack_series
+
+
+def warning_on_one_line(message, category, filename, lineno, file=None, line=None):
+    return '%s:%s: %s: %s\n' % (filename, lineno, category.__name__, message)
+
+warnings.formatwarning = warning_on_one_line
 
 
 def fourier_series(t, p, n):
@@ -272,28 +279,48 @@ class HierarchicalProphet:
 
         if hyper:
 
-            assert self.trend_hierarchical, 'hyper=True but trend not hierarchical'
+            if self.trend_hierarchical:
+            
+                m = np.random.normal(self.pe['m_mu'], self.pe['m_sigma'])
+                k = np.random.normal(self.pe['k_mu'], self.pe['k_sigma'])
+                delta = np.random.laplace(0, self.pe['delta_b'], (A.shape[1], 1))
 
-            m = np.random.normal(self.pe['m_mu'], self.pe['m_sigma'])
-            k = np.random.normal(self.pe['k_mu'], self.pe['k_sigma'])
-            delta = np.random.laplace(0, self.pe['delta_b'], (A.shape[1], 1))
+            else:
+
+                warnings.warn('hyper=True but trend not hierarchical, using MLEs')
+
+                # MLEs for normal distribution
+                m_mu = np.mean(self.pe['m'])
+                m_sd = np.std(self.pe['m'])
+                m = np.random.normal(m_mu, m_sd)
+
+                # MLEs for normal distribution
+                k_mu = np.mean(self.pe['k'])
+                k_sd = np.std(self.pe['k'])
+                k = np.random.normal(k_mu, k_sd)
+
+                # Median and MAD are the MLEs for mu and beta parameter of laplace distribution
+                delta_mu = np.median(self.pe['delta'], axis=0)
+                delta_b = st.median_absolute_deviation(self.pe['delta'], axis=0)
+                delta = np.random.laplace(delta_mu, delta_b, (self.n_changepoints, 1))
 
         else:
 
             delta = self.pe['delta'].T
 
-            if any(t > 1):
-
-                # MAD is the MLE for beta parameter of laplace distribution
-                beta = scipy.stats.median_absolute_deviation(self.pe['delta'], axis=1)
-
-                n_future_changepoints = len(s) - self.n_changepoints
-                future_delta = np.random.laplace(0, beta, (n_future_changepoints, self.n_series))
-                delta = np.r_[delta, future_delta]
-
             # Fix dimensions
             m = np.repeat(self.pe['m'][None, :], t.shape[0], axis=0)
             k = np.repeat(self.pe['k'][None, :], t.shape[0], axis=0)
+
+        if any(t > 1):
+
+            # Median and MAD are the MLEs for mu and beta parameter of laplace distribution
+            delta_mu = np.median(self.pe['delta'])
+            delta_b = st.median_absolute_deviation(np.ravel(self.pe['delta']))
+
+            n_future_changepoints = A.shape[1] - self.n_changepoints
+            future_delta = np.random.laplace(delta_mu, delta_b, (n_future_changepoints, delta.shape[1]))
+            delta = np.r_[delta, future_delta]
 
         g_t = m
         g_t += (k + A @ delta) * t[:, None]
@@ -329,9 +356,6 @@ class HierarchicalProphet:
 
     def sample_seasonality(self, t, hyper=False):
 
-        if hyper:
-            assert self.seasonality_hierarchical, 'hyper=True but seasonality not hierarchical'
-
         # Scale t
         t = self.scalers['t'].transform(t)
 
@@ -345,10 +369,24 @@ class HierarchicalProphet:
             F = fourier_series(t, fc['period_scaled'], fc['n_fourier'])
 
             if hyper:
-                beta_mu = self.pe['beta_mu_{}'.format(p)]
-                beta_sigma = self.pe['beta_sigma_{}'.format(p)]
-                beta = np.random.normal(beta_mu, beta_sigma, size=(F.shape[1], 1))
+
+                if self.seasonality_hierarchical:
+
+                    beta_mu = self.pe['beta_mu_{}'.format(p)]
+                    beta_sigma = self.pe['beta_sigma_{}'.format(p)]
+                    beta = np.random.normal(beta_mu, beta_sigma, size=(F.shape[1], 1))
+
+                else:
+
+                    warnings.warn('hyper=True but seasonality not hierarchical, using MLEs')
+
+                    # Use the MLEs for the normal distribution
+                    beta_mu = np.mean(self.pe['beta_{}'.format(p)], axis=1)
+                    beta_sigma = np.std(self.pe['beta_{}'.format(p)], axis=1)
+                    beta = np.random.normal(beta_mu, beta_sigma, size=(F.shape[1], 1))
+
             else:
+
                 beta = self.pe['beta_{}'.format(p)]
 
             s_t += F @ beta 
@@ -359,8 +397,20 @@ class HierarchicalProphet:
 
         if hyper:
 
-            assert self.eps_hierarchical, 'hyper=True but eps not hierarchical'
-            e_t = np.random.normal(0, self.pe['sigma_beta'], size = (len(t), 1))
+            if self.eps_hierarchical:
+    
+                e_t = np.random.normal(0, self.pe['sigma_beta'], size = (len(t), 1))
+
+            else:
+
+                warnings.warn('hyper=True but eps not hierarchical, using MLEs')
+
+                # Use the MLEs for the normal distribution
+                sigma_mu = np.mean(self.pe['sigma'])
+                sigma_sigma = np.std(self.pe['sigma'])
+
+                e_t = np.random.normal(sigma_mu, sigma_sigma, size = (len(t), 1))
+
 
         else:
 
@@ -397,7 +447,7 @@ class HierarchicalProphet:
 
 if __name__=='__main__':
 
-    import utils
+    import random
 
     cols = ['t', 'y_0', 'y_1']
 
