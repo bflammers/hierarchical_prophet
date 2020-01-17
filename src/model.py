@@ -78,7 +78,7 @@ class HierarchicalProphet:
         trend=True, trend_hierarchical=True, seasonality=True, seasonality_hierarchical=False,
         eps_hierarchical=False, n_changepoints=50, changepoints_range=0.8, 
         fourier_params=[{'period': 365.25, 'n_fourier': 8}, {'period': 7, 'n_fourier': 4}],
-        full_posterior=False, maxeval=5000):
+        full_posterior=False, n_sample=500, maxeval=5000):
 
         # Model parameters
         self.trend = trend
@@ -90,7 +90,8 @@ class HierarchicalProphet:
         self.changepoint_range = changepoints_range
         self.fourier_components = fourier_params
         self.full_posterior = full_posterior
-        self.maxeval=maxeval
+        self.n_sample = n_sample
+        self.maxeval = maxeval
 
         # Intialize attributes
         self.df_columns = None
@@ -98,6 +99,7 @@ class HierarchicalProphet:
         self.model = None # PyMC3 model object
         self.n_series = None # Number of series, determined in fitting step
         self.pe = None # Point estimates
+        self.trace = None # 
 
     def fit(self, X):
 
@@ -145,7 +147,12 @@ class HierarchicalProphet:
         
         # Fitting step
         if self.full_posterior:
+            
             raise NotImplementedError('Full posterior not supported yet')
+            
+            with self.model:
+                self.trace = pm.sample(self.n_sample)
+
         else:
 
             with self.model:
@@ -226,7 +233,6 @@ class HierarchicalProphet:
                 # Likelihood
                 sigma = pm.HalfCauchy('sigma', .5, testval=1, shape=self.n_series)
                 Y_obs = pm.Normal('Y_obs', mu=mu_t, sd=sigma[idx], observed=y)
-
 
     def add_trend(self, t, idx, s, A):
 
@@ -393,7 +399,7 @@ class HierarchicalProphet:
 
         return t, s_t
 
-    def sample_eps(self, t, hyper=False):
+    def sample_eps(self, t, hyper):
 
         if hyper:
 
@@ -405,12 +411,10 @@ class HierarchicalProphet:
 
                 warnings.warn('hyper=True but eps not hierarchical, using MLEs')
 
-                # Use the MLEs for the normal distribution
-                sigma_mu = np.mean(self.pe['sigma'])
-                sigma_sigma = np.std(self.pe['sigma'])
+                # Use the MLEs the halfcauchy distribution
+                sigma_sigma = st.halfcauchy.fit(self.pe['sigma'])[1]
 
-                e_t = np.random.normal(sigma_mu, sigma_sigma, size = (len(t), 1))
-
+                e_t = np.random.normal(0, sigma_sigma, size = (len(t), 1))
 
         else:
 
@@ -418,27 +422,30 @@ class HierarchicalProphet:
 
         return t, e_t
 
-    def sample(self, t, white_noise=True, hyper=False):
+    def sample(self, t, white_noise=True, hyper_trend=False, hyper_seasonality=False, \
+        hyper_eps=False):
 
-        _, g_t = self.sample_trend(t, hyper=hyper)
-        t, s_t = self.sample_seasonality(t, hyper=hyper)
+        _, g_t = self.sample_trend(t, hyper=hyper_trend)
+        t, s_t = self.sample_seasonality(t, hyper=hyper_seasonality)
 
         y_t = g_t + s_t 
 
         if white_noise:
-            _, e_t = self.sample_eps(t, hyper=hyper)
-            y_t += e_t
+            _, e_t = self.sample_eps(t, hyper=hyper_eps)
+            y_t = y_t + e_t
 
-        return self._construct_df(t, y_t, hyper=hyper)
+        all_hyper = hyper_seasonality and hyper_seasonality and hyper_eps
+        return self._construct_df(t, y_t, hyper=all_hyper)
 
     def empirical_quantiles(self, t, quantiles=[0.05, 0.5, 0.95], n_samples=1000, 
-        white_noise=True, hyper=False):
+        white_noise=True, hyper_trend=False, hyper_seasonality=False, hyper_eps=False):
 
         samples = np.ndarray((len(t), self.n_series, n_samples))
 
         for i in range(n_samples):
 
-            samples[:, :, i] = self.sample(t, white_noise, hyper).drop(columns='t')
+            samples[:, :, i] = self.sample(t, white_noise, hyper_trend, hyper_seasonality, \
+                hyper_eps).drop(columns='t')
 
         quantiles = np.quantile(samples, quantiles, axis = 2)
 
